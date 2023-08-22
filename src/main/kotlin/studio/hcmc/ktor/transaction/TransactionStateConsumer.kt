@@ -46,29 +46,9 @@ class TransactionStateConsumerConfig(
     /**
      * 로그 수집
      */
-    var logger: Logger = LoggerFactory.getLogger("TransactionStateConsumer"),
-    /**
-     * polled record를 처리할 수 없을 때 재송신할 producer
-     */
-    var producer: KafkaProducer<String, TransactionState> = KafkaProducer(
-        Properties().apply {
-            setProperty("bootstrap.servers", topics.joinToString(","))
-        },
-        StringSerializer(),
-        TransactionState.KafkaSerializer
-    ),
-    /**
-     * 처리할 record를 읽을 consumer
-     */
-    var consumer: KafkaConsumer<String, TransactionState> = KafkaConsumer(
-        Properties().apply {
-            setProperty("bootstrap.servers", topics.joinToString(","))
-            setProperty("group.id", groupId)
-        },
-        StringDeserializer(),
-        TransactionState.KafkaDeserializer
-    )
-)
+    var logger: Logger = LoggerFactory.getLogger("TransactionStateConsumer")
+) {
+}
 
 internal val transactions = HashMap<UUID, TransactionState>()
 internal val transactionLock = Mutex()
@@ -87,24 +67,43 @@ val TransactionStateConsumer = createApplicationPlugin("TransactionStateConsumer
 
     application.attributes.put(transactionIdHeaderNameKey, pluginConfig.transactionIdHeaderName)
 
+    val producer: KafkaProducer<String, TransactionState> = KafkaProducer(
+        Properties().apply {
+            setProperty("bootstrap.servers", pluginConfig.url.joinToString(","))
+        },
+        StringSerializer(),
+        TransactionState.KafkaSerializer
+    )
+    val consumer: KafkaConsumer<String, TransactionState> = KafkaConsumer(
+        Properties().apply {
+            setProperty("bootstrap.servers", pluginConfig.url.joinToString(","))
+            setProperty("group.id", pluginConfig.groupId)
+        },
+        StringDeserializer(),
+        TransactionState.KafkaDeserializer
+    )
+
     newSingleThreadContext("TransactionStateConsumer").launch {
-        pluginConfig.consumer.subscribe(pluginConfig.topics)
+        consumer.subscribe(pluginConfig.topics)
 
         while (true) {
-            val records = pluginConfig.consumer.poll(Duration.ZERO)
+            val records = consumer.poll(Duration.ZERO)
             if (records.isEmpty) {
                 delay(pluginConfig.emptyDelayMillis)
                 continue
             }
 
             for (record in records) {
-                onEachRecord(record)
+                onEachRecord(producer, record)
             }
         }
     }
 }
 
-private suspend fun PluginBuilder<TransactionStateConsumerConfig>.onEachRecord(record: ConsumerRecord<String, TransactionState>) {
+private suspend fun PluginBuilder<TransactionStateConsumerConfig>.onEachRecord(
+    producer: KafkaProducer<String, TransactionState>,
+    record: ConsumerRecord<String, TransactionState>
+) {
     val transactionId = record.headers()
         .associateBy { it.key() }[pluginConfig.transactionIdHeaderName]
         ?.let { UUID.fromString(String(it.value())) } ?: return
@@ -122,7 +121,7 @@ private suspend fun PluginBuilder<TransactionStateConsumerConfig>.onEachRecord(r
     }
 
     pluginConfig.logger.warn("No matching prefix for transaction $transactionId, re-sending record: key=${record.key()}, value=${record.value()}")
-    pluginConfig.producer.send(ProducerRecord(
+    producer.send(ProducerRecord(
         record.topic(),
         record.partition(),
         record.timestamp(),
