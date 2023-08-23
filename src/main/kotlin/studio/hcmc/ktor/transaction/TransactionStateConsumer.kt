@@ -3,6 +3,7 @@ package studio.hcmc.ktor.transaction
 import io.ktor.server.application.*
 import io.ktor.util.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.apache.kafka.clients.consumer.ConsumerRecord
@@ -50,7 +51,7 @@ class TransactionStateConsumerConfig(
 ) {
 }
 
-internal val transactions = HashMap<UUID, TransactionState>()
+internal val transactions = HashMap<UUID, Pair<Int, Channel<TransactionState>>>()
 internal val transactionLock = Mutex()
 internal val transactionIdHeaderNameKey = AttributeKey<String>("TransactionIdHeaderName")
 
@@ -111,11 +112,14 @@ private suspend fun PluginBuilder<TransactionStateConsumerConfig>.onEachRecord(
     val key = record.key()
     for (keyPrefix in pluginConfig.keyPrefixes) {
         if (key.startsWith(keyPrefix)) {
-            Dispatchers.Transaction.launch {
-                transactionLock.withLock {
-                    transactions[transactionId] = record.value()
-                }
+            val (count, channel) = withContext(Dispatchers.Transaction) {
+                transactionLock.withLock { transactions.remove(transactionId) }
+            } ?: continue
+
+            repeat(count) {
+                channel.send(record.value())
             }
+
             return
         }
     }
