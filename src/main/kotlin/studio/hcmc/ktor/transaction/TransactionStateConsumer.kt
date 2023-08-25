@@ -6,10 +6,14 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.apache.kafka.clients.admin.AdminClient
+import org.apache.kafka.clients.admin.ConsumerGroupDescription
+import org.apache.kafka.clients.admin.KafkaAdminClient
 import org.apache.kafka.clients.consumer.ConsumerRecord
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.KafkaProducer
 import org.apache.kafka.clients.producer.ProducerRecord
+import org.apache.kafka.common.KafkaException
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.kafka.common.serialization.StringSerializer
 import org.slf4j.Logger
@@ -83,6 +87,12 @@ val TransactionStateConsumer = createApplicationPlugin("TransactionStateConsumer
         StringDeserializer(),
         TransactionState.KafkaDeserializer
     )
+    val admin = KafkaAdminClient.create(
+        Properties().apply {
+            setProperty("bootstrap.servers", pluginConfig.url.joinToString(","))
+        }
+    )
+    consumer.groupMetadata().memberId()
 
     newSingleThreadContext("TransactionStateConsumer").launch {
         consumer.subscribe(pluginConfig.topics)
@@ -95,7 +105,7 @@ val TransactionStateConsumer = createApplicationPlugin("TransactionStateConsumer
             }
 
             for (record in records) {
-                onEachRecord(producer, record)
+                onEachRecord(producer, consumer, admin, record)
             }
         }
     }
@@ -103,6 +113,8 @@ val TransactionStateConsumer = createApplicationPlugin("TransactionStateConsumer
 
 private suspend fun PluginBuilder<TransactionStateConsumerConfig>.onEachRecord(
     producer: KafkaProducer<String, TransactionState>,
+    consumer: KafkaConsumer<*, *>,
+    admin: AdminClient,
     record: ConsumerRecord<String, TransactionState>
 ) {
     val transactionId = record.headers()
@@ -124,13 +136,40 @@ private suspend fun PluginBuilder<TransactionStateConsumerConfig>.onEachRecord(
         }
     }
 
-    pluginConfig.logger.warn("No matching prefix for transaction $transactionId, re-sending record: key=${record.key()}, value=${record.value()}")
-    producer.send(ProducerRecord(
-        record.topic(),
-        record.partition(),
-        record.timestamp(),
-        record.key(),
-        record.value(),
-        record.headers()
-    ))
+    val waitingConsumers = admin.describeConsumerGroup(pluginConfig.groupId).members().size
+    val visitedConsumers = record.headers().filter { it.key().startsWith("visited") && String(it.value()).toBooleanStrict() }.size
+    if (waitingConsumers == visitedConsumers) {
+        pluginConfig.logger.error("Dropping record. all consumers re-sent: record=$record")
+    } else {
+        pluginConfig.logger.warn("No matching prefix for transaction $transactionId, re-sending record=$record")
+        val nextHeaders = record.headers()
+        nextHeaders.add("visited-${consumer.groupMetadata().memberId()}", "true".toByteArray())
+        producer.send(ProducerRecord(
+            record.topic(),
+            record.partition(),
+            record.timestamp(),
+            record.key(),
+            record.value(),
+            nextHeaders
+        ))
+    }
+}
+
+private suspend fun AdminClient.describeConsumerGroup(groupId: String): ConsumerGroupDescription {
+    return suspendCancellableCoroutine {
+        describeConsumerGroups(listOf(groupId)).all().whenComplete { map, throwable ->
+            if (throwable != null) {
+                it.resumeWith(Result.failure(throwable))
+                return@whenComplete
+            }
+
+            val byGroupId = map[groupId]
+            if (byGroupId == null) {
+                it.resumeWith(Result.failure(KafkaException("groupId not found: $groupId")))
+                return@whenComplete
+            }
+
+            it.resumeWith(Result.success(byGroupId))
+        }
+    }
 }

@@ -6,10 +6,9 @@ import org.jetbrains.exposed.sql.Transaction
 import java.util.*
 import kotlin.collections.ArrayList
 
-public suspend fun Transaction.awaitTransactionState(
+suspend fun Transaction.awaitTransactionState(
     transactionId: UUID
 ) {
-    ArrayList
     val channel = transactionLock.withLock {
         val present = transactions[transactionId]
         if (present == null) {

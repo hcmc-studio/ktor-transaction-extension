@@ -6,6 +6,7 @@ import io.ktor.server.resources.post
 import io.ktor.server.routing.*
 import io.ktor.util.pipeline.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.withContext
 import org.jetbrains.exposed.sql.Transaction
 import studio.hcmc.exposed.transaction.Transaction
@@ -23,7 +24,7 @@ val ApplicationRequest.transactionId: UUID get() = runCatching {
     throw invalidTransactionId
 }
 
-public inline fun <reified T : Any> Route.postTransaction(
+inline fun <reified T : Any> Route.postTransaction(
     noinline body: suspend PipelineContext<Unit, ApplicationCall>.(T, Transaction) -> Unit
 ): Route {
     return post<T> { resource ->
@@ -37,7 +38,7 @@ public inline fun <reified T : Any> Route.postTransaction(
     }
 }
 
-public inline fun <reified T : Any, reified R : Any> Route.postTransaction(
+inline fun <reified T : Any, reified R : Any> Route.postTransaction(
     noinline body: suspend PipelineContext<Unit, ApplicationCall>.(T, R, Transaction) -> Unit
 ): Route {
     return postTransaction<T> { resource, transaction ->
